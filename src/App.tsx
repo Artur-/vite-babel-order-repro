@@ -1,22 +1,26 @@
-// Line 1
-// Line 2
-// Line 3: This is a comment
-// Line 4: Another comment
-// Line 5: Yet another comment
-// Line 6: One more comment
+// This file has known line numbers for testing source location accuracy.
+// Do NOT reformat — the test depends on exact line positions.
 
-// Line 8: HelloView should be at line 9
+// Lines 1-4: comments
+// Lines 5-6: imports
+import { useState } from 'react';
+import { useEffect } from 'react';
+
+// Line 9: HelloView function declaration
 export function HelloView() {
+  const [count, setCount] = useState(0);
   return (
     <div className="hello">
       <h1>Hello World</h1>
-      <p>This is a test</p>
+      <p>Count: {count}</p>
+      <button onClick={() => setCount(count + 1)}>+1</button>
     </div>
   );
 }
 
-// Line 18: App should be at line 19
+// Line 20: App function declaration
 export function App() {
+  useEffect(() => {}, []);
   return (
     <div className="app">
       <HelloView />

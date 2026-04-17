@@ -1,58 +1,96 @@
-# Vite 8 Babel/OXC Plugin Order — Source Location Fix
+# Babel AST `loc` produces wrong positions after OXC transform
 
-## Problem
+Reproduction for https://github.com/vitejs/vite-plugin-react/issues/XXXX
 
-Vaadin Copilot needs accurate source location info for React components:
+## The problem
 
-1. **`__debugSourceDefine`** — Added by a custom Babel plugin after each React function component declaration. Contains the `{fileName, lineNumber, columnNumber}` of the function body in the original source. Used to identify route views and match components to source files.
+When a Babel plugin runs **after** `@vitejs/plugin-react`'s OXC JSX transform, the Babel AST `loc` values (e.g., `path.node.body.loc.start.line`) refer to the **OXC-transformed code**, not the original source file.
 
-2. **`_debugInfo.source`** — Added by OXC's jsxDEV transform via a custom `jsxImportSource`. Contains the `{fileName, lineNumber, columnNumber}` of each JSX element in the original source. Used by the component tree to map DOM elements back to source code.
+Any Babel plugin that reads `loc` to embed source positions in the output produces **wrong line numbers**.
 
-Both must point to correct positions in the **original** `.tsx` source file.
+This was not an issue with `@vitejs/plugin-react` v5, where Babel handled both JSX transform and custom plugins in a single pass — `loc` always pointed to the original source.
 
-## How it worked with Vite 7
+## Use case
 
-Vite 7 used **esbuild** for JSX transformation and **Babel** for everything else. The `@vitejs/plugin-react` plugin ran Babel with both JSX transform and the source location plugin in a single pass. Since Babel handled everything, its AST `loc` positions always referred to the original source.
+We have a Babel plugin that inserts source location metadata after each React component:
 
-## What broke with Vite 8
+```js
+// Input:
+export function HelloView() {     // line 10
+  return <div>Hello</div>;
+}
 
-Vite 8 uses **OXC** (via `@vitejs/plugin-react` v6+) for JSX transformation and **`@rolldown/plugin-babel`** for additional transforms. Two problems:
+// Output (inserted by Babel plugin):
+export function HelloView() {
+  return <div>Hello</div>;
+}
+if (typeof HelloView === "function") {
+  HelloView.__debugSourceDefine = {
+    fileName: "/path/to/file.tsx",
+    lineNumber: 10,     // ← should match original source
+    columnNumber: 40
+  };
+}
+```
 
-### Problem 1: Plugin execution order
+Dev tools use `__debugSourceDefine` to map rendered components back to their source files. When line numbers are wrong, the mapping breaks.
 
-`@rolldown/plugin-babel` hardcodes `enforce: 'pre'`, making Babel run **before** OXC. The Babel source location plugin inserts ~4 lines of code (`if (typeof Foo === 'function') { Foo.__debugSourceDefine = {...} }`) after each component declaration. When OXC runs next, it sees the modified code and embeds **wrong line numbers** in `jsxDEV()` calls — shifted by the number of lines Babel inserted.
-
-Attempting to override `enforce` via `Object.assign(babel({...}), { enforce: 'post' })` does not work because `@rolldown/plugin-babel` uses non-enumerable properties and reads `enforce` internally before the override takes effect.
-
-### Problem 2: Babel AST positions after OXC
-
-Even after fixing the execution order, Babel's AST `loc` values refer to the **OXC-transformed** code, not the original source. The transformed code has different line numbers because OXC rewrites imports, adds HMR boilerplate, etc. Using `loc.start.line` for `__debugSourceDefine` produces wrong positions.
-
-## Solution
-
-### Fix 1: Custom Vite plugin instead of @rolldown/plugin-babel
-
-Replace `@rolldown/plugin-babel` with a custom Vite plugin that calls `@babel/core` `transformSync` directly and sets `enforce: 'post'`. This guarantees Babel runs **after** OXC, so OXC sees the original source and produces correct `jsxDEV()` line numbers.
-
-### Fix 2: Read original file for __debugSourceDefine positions
-
-The `addFunctionComponentSourceLocationBabel` plugin now reads the **original source file** from disk using `readFileSync` to find function declaration positions, instead of relying on Babel's AST `loc` values. This ensures `__debugSourceDefine` always contains correct original line numbers regardless of what transforms ran before Babel.
-
-## Running the repro
+## Running the reproduction
 
 ```bash
 npm install
+```
+
+### Mode 1: enforce:'post' (default) — `__debugSourceDefine` wrong
+
+```bash
 npx vite
 ```
 
-Open in browser. The page automatically checks:
-- Whether `__debugSourceDefine` line numbers match the original source
-- Whether `_debugInfo.source` (from jsxDEV) line numbers match the original source
-- Displays ✅ PASS or ❌ FAIL with details
+Babel runs AFTER OXC. OXC's `jsxDEV()` source info is correct, but Babel's AST `loc` values refer to the OXC-transformed code, so `__debugSourceDefine` line numbers are wrong.
+
+### Mode 2: enforce:'pre' — `jsxDEV` source info wrong
+
+```bash
+MODE=pre npx vite
+```
+
+Babel runs BEFORE OXC (the `@rolldown/plugin-babel` default). Babel's `__debugSourceDefine` line numbers are correct, but Babel inserts extra lines that shift OXC's `jsxDEV()` source positions. Every JSX element in the app gets wrong line numbers.
+
+### Mode 3: workaround — both correct
+
+```bash
+MODE=workaround npx vite
+```
+
+All checks pass. Uses a custom Vite plugin with `enforce: 'post'` and reads the original source file from disk to find function positions.
+
+## What the workaround does
+
+1. **Replaces `@rolldown/plugin-babel`** with a custom Vite plugin that calls `@babel/core` directly with `enforce: 'post'` (because `@rolldown/plugin-babel` hardcodes `enforce: 'pre'`)
+
+2. **Reads the original file** from disk using `readFileSync` to find function declaration line numbers via regex, instead of relying on `loc.start.line`
+
+## What would help
+
+In `@vitejs/plugin-react` v5, custom Babel plugins could be passed via `react({ babel: { plugins: [...] } })`. They ran in the same Babel pass as the JSX transform, so `loc` values always referred to the original source.
+
+Possible solutions:
+
+- **Restore the `babel` option** — run custom Babel plugins within the react plugin's transform pipeline, with correct `loc` values
+- **Remap `loc` values** — `@rolldown/plugin-babel` could use the combined source map from previous transforms to remap AST `loc` to original positions before plugins see them
+- **Expose original source** — `@vitejs/plugin-react` could attach the original source text to Vite's module metadata for downstream plugins to access
 
 ## Files
 
-- `vite.config.ts` — Shows the custom Babel plugin with `enforce: 'post'` and original-file-based source location detection
-- `src/App.tsx` — Test component with known line numbers
-- `src/main.tsx` — Automated verification logic
-- `src/jsx-dev-transform/` — Custom JSX dev runtime that stores source info on `_debugInfo.source` (needed for React 19)
+- `vite.config.ts` — Plugin setup with `USE_WORKAROUND` toggle
+- `src/App.tsx` — Test components with known line numbers
+- `src/main.tsx` — Automated source position verification
+- `src/jsx-dev-transform/` — Custom JSX dev runtime for React 19 `_debugInfo.source`
+
+## Related issues
+
+- [vitejs/vite-plugin-react#235](https://github.com/vitejs/vite-plugin-react/issues/235) — lineNumber error for __source prop
+- [vitejs/vite-plugin-react#266](https://github.com/vitejs/vite-plugin-react/issues/266) — Babel reformats the input file, causing source references to be wrong
+- [vitejs/vite-plugin-react#1139](https://github.com/vitejs/vite-plugin-react/issues/1139) — enforce: 'post' required for React Compiler
+- [vitejs/vite#20576](https://github.com/vitejs/vite/issues/20576) — Vite plugin transform needs source map of input

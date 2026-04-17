@@ -4,69 +4,80 @@ import { App, HelloView } from './App';
 const root = createRoot(document.getElementById('root')!);
 root.render(<App />);
 
-// Wait for render, then check source locations
+// Known correct line numbers from App.tsx:
+//   HelloView function:     line 10 (body { on same line)
+//   <div class="hello">:    line 13
+//   <h1>:                   line 14
+//   App function:           line 22 (body { on same line)
+//   <div class="app">:      line 25
+
+const EXPECTED = {
+  helloFunc: 10,
+  helloDivJsx: 13,
+  h1Jsx: 14,
+  appFunc: 22,
+  appDivJsx: 25,
+};
+
 setTimeout(async () => {
   const results: string[] = [];
 
-  // Expected line numbers from App.tsx original source:
-  // Line 9:  export function HelloView() {
-  // Line 11:   <div className="hello">
-  // Line 12:     <h1>Hello World</h1>
-  // Line 19: export function App() {
-  // Line 21:   <div className="app">
-  const helloFuncLine = 9;
-  const appFuncLine = 19;
-  const helloDivLine = 11;
-  const appDivLine = 21;
-  const h1Line = 12;
-
-  // Check __debugSourceDefine (set by Babel plugin)
-  const appDefine = (App as any).__debugSourceDefine;
-  const helloDefine = (HelloView as any).__debugSourceDefine;
-  results.push('=== __debugSourceDefine (from Babel plugin — points to function body) ===');
-
-  function checkDefine(name: string, define: any, expectedLine: number) {
-    const ok = define?.lineNumber === expectedLine;
-    results.push(`${name}: line ${define?.lineNumber} (expected: ${expectedLine}) ${ok ? '✅' : '❌ OFF BY ' + (define?.lineNumber - expectedLine)}`);
+  function check(label: string, actual: number | undefined, expected: number) {
+    if (actual === undefined) {
+      results.push(`  ${label}: NOT FOUND`);
+      return false;
+    }
+    const ok = actual === expected;
+    results.push(`  ${label}: line ${actual} ${ok ? '✅' : `❌ expected ${expected}, off by ${actual - expected}`}`);
+    return ok;
   }
-  checkDefine('HelloView', helloDefine, helloFuncLine);
-  checkDefine('App', appDefine, appFuncLine);
+
+  function getFiberSource(el: Element | null) {
+    if (!el) return undefined;
+    const fiberKey = Object.keys(el).find(k => k.startsWith('__reactFiber$'));
+    if (!fiberKey) return undefined;
+    const fiber = (el as any)[fiberKey];
+    return fiber?._debugSource || fiber?._debugInfo?.source;
+  }
+
+  // Check __debugSourceDefine (set by our Babel plugin)
+  const helloDefine = (HelloView as any).__debugSourceDefine;
+  const appDefine = (App as any).__debugSourceDefine;
+
+  results.push('__debugSourceDefine (Babel plugin — function body location):');
+  const b1 = check('HelloView', helloDefine?.lineNumber, EXPECTED.helloFunc);
+  const b2 = check('App', appDefine?.lineNumber, EXPECTED.appFunc);
   results.push('');
 
-  // Check _debugInfo.source (set by custom jsx-dev-transform)
-  results.push('=== _debugInfo.source (from OXC jsxDEV — points to JSX element) ===');
+  // Check _debugInfo.source (set by OXC jsxDEV via custom jsx-dev-transform)
+  const helloSource = getFiberSource(document.querySelector('.hello'));
+  const appSource = getFiberSource(document.querySelector('.app'));
 
-  function checkSource(el: Element | null, label: string, expectedLine: number) {
-    if (!el) { results.push(`${label}: element not found`); return; }
-    const fiberKey = Object.keys(el).find(k => k.startsWith('__reactFiber$'));
-    if (!fiberKey) { results.push(`${label}: no fiber found`); return; }
-    const fiber = (el as any)[fiberKey];
-    const source = fiber?._debugSource || fiber?._debugInfo?.source;
-    const line = source?.lineNumber;
-    const ok = line === expectedLine;
-    results.push(`${label}: line ${line} (expected: ${expectedLine}) ${ok ? '✅' : '❌ OFF BY ' + (line - expectedLine)}`);
-  }
-
-  checkSource(document.querySelector('.hello'), '<div class="hello">', helloDivLine);
-  checkSource(document.querySelector('h1'), '<h1>', h1Line);
-  checkSource(document.querySelector('.app'), '<div class="app">', appDivLine);
+  results.push('_debugInfo.source (OXC jsxDEV — JSX element location):');
+  const j1 = check('<div class="hello">', helloSource?.lineNumber, EXPECTED.helloDivJsx);
+  const j2 = check('<div class="app">', appSource?.lineNumber, EXPECTED.appDivJsx);
   results.push('');
 
   // Verdict
-  const helloEl = document.querySelector('.hello');
-  const fk = helloEl && Object.keys(helloEl).find(k => k.startsWith('__reactFiber$'));
-  const helloFiber = fk && (helloEl as any)[fk];
-  const helloSource = helloFiber?._debugSource || helloFiber?._debugInfo?.source;
-
-  const jsxDevCorrect = helloSource?.lineNumber === helloDivLine;
-  const babelCorrect = helloDefine?.lineNumber === helloFuncLine;
-
-  results.push('=== VERDICT ===');
-  if (jsxDevCorrect && babelCorrect) {
-    results.push('✅ PASS: Both _debugInfo.source and __debugSourceDefine have correct line numbers');
+  const allPass = b1 && b2 && j1 && j2;
+  if (allPass) {
+    results.push('✅ ALL PASS');
   } else {
-    if (!jsxDevCorrect) results.push(`❌ _debugInfo.source wrong: got ${helloSource?.lineNumber}, expected ${helloDivLine}`);
-    if (!babelCorrect) results.push(`❌ __debugSourceDefine wrong: got ${helloDefine?.lineNumber}, expected ${helloFuncLine}`);
+    results.push('❌ SOME CHECKS FAILED — see above');
+    results.push('');
+    if (!b1 || !b2) {
+      results.push('__debugSourceDefine is wrong because Babel AST loc values');
+      results.push('refer to OXC-transformed code, not the original source.');
+    }
+    if (!j1 || !j2) {
+      results.push('jsxDEV source info is wrong because Babel ran before OXC');
+      results.push('and inserted lines that shifted OXC\'s line numbers.');
+    }
+    results.push('');
+    results.push('Try:');
+    results.push('  npx vite              — enforce:post (default), __debugSourceDefine wrong');
+    results.push('  MODE=pre npx vite     — enforce:pre, jsxDEV wrong');
+    results.push('  MODE=workaround npx vite — both correct');
   }
 
   document.getElementById('output')!.textContent = results.join('\n');
